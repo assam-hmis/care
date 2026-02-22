@@ -2,8 +2,10 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
-from pydantic import UUID4, model_validator
+from pydantic import UUID4, Field, model_validator
 
+from care.emr.extensions.base import ExtensionResource
+from care.emr.extensions.validator import ExtensionValidator
 from care.emr.models.account import Account
 from care.emr.models.invoice import Invoice
 from care.emr.models.location import FacilityLocation
@@ -61,6 +63,7 @@ class BasePaymentReconciliationSpec(EMRResource):
 
     __model__ = PaymentReconciliation
     __exclude__ = ["target_invoice", "account"]
+    ___extension_resource_type__ = ExtensionResource.payment_reconciliation
 
     id: UUID4 | None = None
     reconciliation_type: PaymentReconciliationTypeOptions
@@ -77,14 +80,14 @@ class BasePaymentReconciliationSpec(EMRResource):
     note: str | None = None
 
 
-class PaymentReconciliationWriteSpec(BasePaymentReconciliationSpec):
+class PaymentReconciliationWriteSpec(ExtensionValidator, BasePaymentReconciliationSpec):
     """Payment reconciliation write specification"""
 
     target_invoice: UUID4 | None = None
     account: UUID4
-    amount: Decimal | None = None
-    tendered_amount: Decimal
-    returned_amount: Decimal
+    amount: Decimal | None = Field(default=None, max_digits=20, decimal_places=6)
+    tendered_amount: Decimal = Field(max_digits=20, decimal_places=6)
+    returned_amount: Decimal = Field(max_digits=20, decimal_places=6)
     is_credit_note: bool = False
     location: UUID4 | None = None
 
@@ -104,9 +107,9 @@ class PaymentReconciliationWriteSpec(BasePaymentReconciliationSpec):
 
 
 class PaymentReconciliationMinimalReadSpec(BasePaymentReconciliationSpec):
-    amount: Decimal | None = None
-    tendered_amount: Decimal
-    returned_amount: Decimal
+    amount: Decimal | None = Field(default=None, max_digits=20, decimal_places=6)
+    tendered_amount: Decimal = Field(max_digits=20, decimal_places=6)
+    returned_amount: Decimal = Field(max_digits=20, decimal_places=6)
     is_credit_note: bool
     created_date: datetime
     modified_date: datetime
@@ -136,6 +139,7 @@ class PaymentReconciliationReadSpec(PaymentReconciliationMinimalReadSpec):
 
 class PaymentReconciliationRetrieveSpec(PaymentReconciliationReadSpec):
     location: dict | None = None
+    extensions: dict
 
     created_by: dict | None
     updated_by: dict | None

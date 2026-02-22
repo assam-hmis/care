@@ -50,6 +50,7 @@ class BatchUpdateObservationRequest(BaseModel):
 
 class DiagnosticReportFilters(filters.FilterSet):
     status = filters.CharFilter(lookup_expr="iexact")
+    encounter = filters.UUIDFilter(field_name="encounter__external_id")
 
 
 class DiagnosticReportViewSet(
@@ -138,7 +139,16 @@ class DiagnosticReportViewSet(
                 service_request,
             ):
                 return queryset.filter(service_request=service_request)
-        raise ValidationError("Service Request or encounter is required")
+        else:
+            # Authorize with Patient
+            patient = self.get_patient_obj()
+            if AuthorizationController.call(
+                "can_view_clinical_data",
+                self.request.user,
+                patient,
+            ):
+                return queryset.filter(patient=patient)
+        raise ValidationError("Authorization Failed, Request Denied")
 
     @extend_schema(
         request=BatchUpdateObservationRequest,

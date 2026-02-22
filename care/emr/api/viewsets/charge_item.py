@@ -1,7 +1,11 @@
+from datetime import timedelta
+
+from django.conf import settings
 from django.db import transaction
 from django_filters import rest_framework as filters
 from drf_spectacular.utils import extend_schema
-from pydantic import UUID4, BaseModel, model_validator
+from pydantic import UUID4, BaseModel, Field, model_validator
+from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import OrderingFilter
@@ -28,6 +32,7 @@ from care.emr.registries.system_questionnaire.system_questionnaire import (
     InternalQuestionnaireRegistry,
 )
 from care.emr.resources.account.default_account import get_default_account
+from care.emr.resources.account.sync_items import rebalance_account_task
 from care.emr.resources.charge_item.apply_charge_item_definition import (
     apply_charge_item_definition,
 )
@@ -53,16 +58,23 @@ from care.emr.tagging.filters import SingleFacilityTagFilter
 from care.facility.models.facility import Facility
 from care.security.authorization.base import AuthorizationController
 from care.users.models import User
+from care.utils.filters.multiselect import MultiSelectFilter
 from care.utils.shortcuts import get_object_or_404
+from care.utils.time_util import care_now
 
 
-class ChargeItemDefinitionFilters(filters.FilterSet):
-    status = filters.CharFilter(lookup_expr="iexact")
+class ChargeItemFilters(filters.FilterSet):
+    status = MultiSelectFilter(field_name="status")
     title = filters.CharFilter(lookup_expr="icontains")
     account = filters.UUIDFilter(field_name="account__external_id")
     encounter = filters.UUIDFilter(field_name="encounter__external_id")
-    service_resource = filters.CharFilter(lookup_expr="iexact")
+    service_resource = MultiSelectFilter()
     service_resource_id = filters.CharFilter(lookup_expr="iexact")
+    patient = filters.UUIDFilter(field_name="patient__external_id")
+    paid_on = filters.DateTimeFromToRangeFilter(field_name="paid_on")
+    performer_actor = filters.UUIDFilter(field_name="performer_actor__external_id")
+    created_date = filters.DateTimeFromToRangeFilter(field_name="created_date")
+    created_by = filters.UUIDFilter(field_name="created_by__external_id")
 
 
 class ApplyChargeItemDefinitionRequest(BaseModel):
@@ -86,6 +98,11 @@ class ApplyChargeItemDefinitionRequest(BaseModel):
         if self.service_resource and not self.service_resource_id:
             raise ValueError("Service resource id is required.")
         return self
+
+
+class ChargeItemAccountChangeRequest(BaseModel):
+    charge_items: list[UUID4] = Field(min_length=1, max_length=100)
+    target_account: UUID4
 
 
 class ApplyMultipleChargeItemDefinitionRequest(BaseModel):
@@ -135,13 +152,13 @@ class ChargeItemViewSet(
     pydantic_model = ChargeItemWriteSpec
     pydantic_update_model = ChargeItemUpdateSpec
     pydantic_read_model = ChargeItemReadSpec
-    filterset_class = ChargeItemDefinitionFilters
+    filterset_class = ChargeItemFilters
     filter_backends = [
         filters.DjangoFilterBackend,
         OrderingFilter,
         SingleFacilityTagFilter,
     ]
-    ordering_fields = ["created_date", "modified_date"]
+    ordering_fields = ["created_date", "modified_date", "title"]
     questionnaire_type = "charge_item"
     questionnaire_title = "Charge Item"
     questionnaire_description = "Charge Item"
@@ -194,23 +211,58 @@ class ChargeItemViewSet(
             )
         if model_obj and model_obj.status in CHARGE_ITEM_CANCELLED_STATUS:
             raise ValidationError("No updates allowed on cancelled charge item")
-        if model_obj and instance.status in [
-            ChargeItemStatusOptions.billed.value,
-            ChargeItemStatusOptions.paid.value,
-        ]:
+        last_obj = None
+        if model_obj:
+            last_obj = ChargeItem.objects.get(id=model_obj.id)
+        if (
+            model_obj
+            and last_obj
+            and last_obj.status != instance.status
+            and instance.status
+            in [
+                ChargeItemStatusOptions.billed.value,
+                ChargeItemStatusOptions.paid.value,
+            ]
+        ):
             raise ValidationError("Charge item status cannot be manually changed.")
         return super().validate_data(instance, model_obj)
+
+    def authorize_cancel(self, instance):
+        if instance.created_date >= care_now() - timedelta(
+            minutes=settings.CHARGE_ITEM_FREE_CANCEL_PERIOD_MINUTES
+        ):
+            return True
+        if not AuthorizationController.call(
+            "can_cancel_charge_item_in_facility",
+            self.request.user,
+            instance.facility,
+        ):
+            raise PermissionDenied("Access Denied to Cancel Charge Item")
+        # Write permission is already checked
+        return True
 
     def perform_update(self, instance):
         with transaction.atomic():
             # TODO Lock Charge item and Invoice
             old_obj = ChargeItem.objects.get(id=instance.id)
+            sync = True
+            if (
+                instance.charge_item_definition
+                and not instance.charge_item_definition.can_edit_charge_item
+            ):
+                instance.unit_price_components = old_obj.unit_price_components
+                instance.total_price_components = old_obj.total_price_components
+                instance.total_price = old_obj.total_price
+                instance.quantity = old_obj.quantity
+                sync = False
             if (
                 old_obj.status != instance.status
                 and instance.status in CHARGE_ITEM_CANCELLED_STATUS
             ):
+                self.authorize_cancel(instance)
                 handle_charge_item_cancel(instance)
-            sync_charge_item_costs(instance)
+            if sync:
+                sync_charge_item_costs(instance)
             super().perform_update(instance)
             if (
                 instance.paid_invoice
@@ -245,6 +297,7 @@ class ChargeItemViewSet(
             model_instance.facility,
         ):
             raise PermissionDenied("Access Denied to Charge Item")
+        return True
 
     def get_queryset(self):
         facility = self.get_facility_obj()
@@ -270,6 +323,11 @@ class ChargeItemViewSet(
             facility,
         ):
             raise PermissionDenied("Access Denied to Charge Item")
+        negative_allowed = AuthorizationController.call(
+            "can_create_negative_charge_item_in_facility",
+            self.request.user,
+            facility,
+        )
         request_params = ApplyMultipleChargeItemDefinitionRequest(**request.data)
         with transaction.atomic():
             for charge_item_request in request_params.requests:
@@ -321,6 +379,7 @@ class ChargeItemViewSet(
                     facility,
                     encounter=encounter,
                     quantity=quantity,
+                    negative_allowed=negative_allowed,
                 )
                 if charge_item_request.service_resource:
                     charge_item.service_resource = charge_item_request.service_resource
@@ -344,6 +403,44 @@ class ChargeItemViewSet(
                 charge_item.updated_by = request.user
                 charge_item.save()
         return Response({})
+
+    @extend_schema(
+        request=ChargeItemAccountChangeRequest,
+    )
+    @action(methods=["POST"], detail=False)
+    def change_account(self, request, *args, **kwargs):
+        """
+        Change accounts related to a charge item.
+        """
+        facility = self.get_facility_obj()
+        if not AuthorizationController.call(
+            "can_create_charge_item_in_facility",
+            self.request.user,
+            facility,
+        ):
+            raise PermissionDenied("Access Denied to Charge Item")
+        request_params = ChargeItemAccountChangeRequest(**request.data)
+        target_account = get_object_or_404(
+            Account, external_id=request_params.target_account, facility=facility
+        )
+        source_accounts = [target_account.id]  # For Rebalancing all related accounts
+        with transaction.atomic():
+            for charge_item_request in request_params.charge_items:
+                charge_item = get_object_or_404(
+                    ChargeItem,
+                    external_id=charge_item_request,
+                    facility=facility,
+                    patient=target_account.patient,
+                )
+                if charge_item.status != ChargeItemStatusOptions.billable.value:
+                    raise ValidationError({"charge_item": "should be billable"})
+                source_accounts.append(charge_item.account_id)
+                charge_item.account = target_account
+                charge_item.save(update_fields=["account"])
+
+        for account_id in list(set(source_accounts)):
+            rebalance_account_task(account_id)
+        return Response({}, status=status.HTTP_201_CREATED)
 
 
 InternalQuestionnaireRegistry.register(ChargeItemViewSet)

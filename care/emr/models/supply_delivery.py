@@ -31,6 +31,9 @@ class SupplyDelivery(EMRBaseModel):
         blank=True,
     )
     extensions = models.JSONField(default=dict)
+    total_purchase_price = models.DecimalField(
+        null=True, blank=True, max_digits=20, decimal_places=6
+    )
 
 
 class DeliveryOrder(EMRBaseModel):
@@ -54,3 +57,9 @@ class DeliveryOrder(EMRBaseModel):
         on_delete=models.CASCADE,
     )
     extensions = models.JSONField(default=dict)
+    patient = models.ForeignKey(
+        "emr.Patient", on_delete=models.PROTECT, null=True, blank=True, default=None
+    )
+    patient_invoice = models.ForeignKey(
+        "emr.Invoice", on_delete=models.PROTECT, null=True, blank=True, default=None
+    )

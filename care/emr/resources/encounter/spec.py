@@ -27,7 +27,7 @@ from care.emr.resources.facility.spec import FacilityBareMinimumSpec
 from care.emr.resources.facility_organization.spec import FacilityOrganizationReadSpec
 from care.emr.resources.location.spec import (
     FacilityLocationEncounterListSpecWithLocation,
-    FacilityLocationListSpec,
+    FacilityLocationMinimalListSpec,
 )
 from care.emr.resources.patient.spec import PatientListSpec, PatientRetrieveSpec
 from care.emr.resources.permissions import EncounterPermissionsMixin
@@ -125,6 +125,8 @@ class EncounterListSpec(EncounterSpecBase):
     created_date: datetime.datetime
     modified_date: datetime.datetime
     tags: list[dict] = []
+    current_location: dict | None = None
+    care_team: list[dict] = []
 
     @classmethod
     def perform_extra_serialization(cls, mapping, obj):
@@ -132,6 +134,24 @@ class EncounterListSpec(EncounterSpecBase):
         mapping["patient"] = PatientListSpec.serialize(obj.patient).to_json()
         mapping["facility"] = FacilityBareMinimumSpec.serialize(obj.facility).to_json()
         mapping["tags"] = SingleFacilityTagManager().render_tags(obj)
+        mapping["current_location"] = None
+        if obj.current_location:
+            mapping["current_location"] = FacilityLocationMinimalListSpec.serialize(
+                obj.current_location
+            ).to_json()
+        care_team = []
+        user_mapping = {x["user_id"]: x for x in obj.care_team}
+        user_ids = list(user_mapping.keys())
+
+        for user_id in user_ids:
+            care_team.append(
+                {
+                    "member": model_from_cache(UserSpec, id=user_id),
+                    "role": user_mapping[user_id]["role"],
+                }
+            )
+
+        mapping["care_team"] = care_team
 
 
 class EncounterRetrieveSpec(EncounterListSpec, EncounterPermissionsMixin):
@@ -139,7 +159,6 @@ class EncounterRetrieveSpec(EncounterListSpec, EncounterPermissionsMixin):
     created_by: dict = {}
     updated_by: dict = {}
     organizations: list[dict] = []
-    current_location: dict | None = None
     location_history: list[dict] = []
     care_team: list[dict] = []
     extensions: dict
@@ -161,17 +180,17 @@ class EncounterRetrieveSpec(EncounterListSpec, EncounterPermissionsMixin):
             FacilityOrganizationReadSpec.serialize(encounter_org.organization).to_json()
             for encounter_org in organizations
         ]
-        mapping["current_location"] = None
-        if obj.current_location:
-            mapping["current_location"] = FacilityLocationListSpec.serialize(
-                obj.current_location
-            ).to_json()
         mapping["location_history"] = [
             FacilityLocationEncounterListSpecWithLocation.serialize(i)
             for i in FacilityLocationEncounter.objects.filter(encounter=obj).order_by(
                 "-created_date"
             )
         ]
+        mapping["current_location"] = None
+        if obj.current_location:
+            mapping["current_location"] = FacilityLocationMinimalListSpec.serialize(
+                obj.current_location
+            ).to_json()
 
         care_team = []
         user_mapping = {x["user_id"]: x for x in obj.care_team}
